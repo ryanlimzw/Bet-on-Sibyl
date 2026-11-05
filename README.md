@@ -1,3 +1,7 @@
+## Updated football workflow (Python 3)
+
+For Premier League and UEFA Champions League predictions, follow [FOOTBALL_SETUP.md](FOOTBALL_SETUP.md). Start with `python -m modern_football --help`. The original scripts below are legacy Python 2 code.
+
 ======================![Sibyl Logo](Images/Sibyl_white_logo.png)======================
 
 

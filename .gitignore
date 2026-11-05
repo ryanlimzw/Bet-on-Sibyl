@@ -14,3 +14,10 @@ eggs/
 lib/
 lib64/
 var/
+
+# Modern football runtime
+.venv/
+__pycache__/
+.env
+data/football/
+outputs/
