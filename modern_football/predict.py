@@ -16,7 +16,11 @@ from sklearn.metrics import accuracy_score, log_loss
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
 
+from .features import EnhancedState, kickoff
+
 COMPETITIONS = ('PL', 'CL')
+DOMESTIC = ('BL1', 'PD', 'SA', 'FL1', 'DED', 'PPL')
+DATA_COMPETITIONS = COMPETITIONS + DOMESTIC
 LABELS = ('A', 'D', 'H')
 
 
@@ -93,18 +97,23 @@ class State:
         self.count[a] += 1
 
 
-def training_rows(matches):
-    state, rows, labels, dates = State(), [], [], []
-    # Batch identical kickoffs: results cannot leak between simultaneous games.
-    for date in sorted({m['utcDate'] for m in matches}):
-        group = [m for m in matches if m['utcDate'] == date]
+def training_rows(matches, baseline=False):
+    state, rows, labels, dates = State() if baseline else EnhancedState(), [], [], []
+    if baseline:
+        matches = [m for m in matches if m["competition"]["code"] in COMPETITIONS]
+    # Use only prior calendar-day results, including across domestic/European games.
+    groups = defaultdict(list)
+    for m in matches:
+        groups[kickoff(m).date()].append(m)
+    for date in sorted(groups):
+        group = sorted(groups[date], key=kickoff)
         for m in group:
             score = score90(m)
-            if score is None:
+            if score is None or m["competition"]["code"] not in COMPETITIONS:
                 continue
             rows.append(state.features(m))
             labels.append('H' if score[0] > score[1] else 'D' if score[0] == score[1] else 'A')
-            dates.append(date)
+            dates.append(kickoff(m).isoformat())
         for m in group:
             state.update(m)
     return np.array(rows), np.array(labels), dates, state
@@ -114,43 +123,89 @@ def estimator():
     return make_pipeline(StandardScaler(), LogisticRegression(max_iter=2000, C=0.5))
 
 
-def run(matches, now, days):
+def fit_model(X, y, dates, weighted=False):
+    model = estimator()
+    if weighted:
+        parsed = [datetime.fromisoformat(d) for d in dates]
+        latest = max(parsed)
+        weights = np.array([2 ** (-(latest - d).total_seconds() / 86400 / 365) for d in parsed])
+        return model.fit(X, y, logisticregression__sample_weight=weights)
+    return model.fit(X, y)
+
+
+def evaluate(X, y, dates, completed, old_X):
+    ordered = sorted([m for m in completed if score90(m) is not None
+                      and m['competition']['code'] in COMPETITIONS], key=kickoff)
+    # Stable input order for ties matches training_rows.
+    codes = np.array([m['competition']['code'] for m in ordered])
+    folds = []
+    # Expanding-window tests, fixed before observing results; final 20% separate.
+    for low, high in ((.5, .65), (.65, .8), (.8, 1.0)):
+        start = dates[int(len(dates) * low)]
+        end = dates[int(len(dates) * high)] if high < 1 else None
+        train = np.array([d < start for d in dates])
+        test = np.array([d >= start and (end is None or d < end) for d in dates])
+        if not test.any() or len(set(y[train])) != 3:
+            continue
+        majority = max(LABELS, key=lambda label: sum(y[train] == label))
+        fold = {'test_start_utc': start, 'test_end_exclusive_utc': end,
+                'training_matches': int(train.sum()), 'test_matches': int(test.sum()), 'models': {}}
+        for name, features, weighted in [('previous', old_X, False), ('enhanced', X, True)]:
+            model = fit_model(features[train], y[train], np.array(dates)[train], weighted)
+            probs = model.predict_proba(features[test])
+            predictions = model.classes_[probs.argmax(axis=1)]
+            results = {}
+            for code in ('ALL', *COMPETITIONS):
+                subset = np.ones(test.sum(), dtype=bool) if code == 'ALL' else codes[test] == code
+                if not subset.any():
+                    continue
+                results[code] = {'matches': int(subset.sum()),
+                                 'accuracy': float(accuracy_score(y[test][subset], predictions[subset])),
+                                 'log_loss': float(log_loss(y[test][subset], probs[subset], labels=model.classes_)),
+                                 'majority_baseline_accuracy': float(np.mean(y[test][subset] == majority))}
+            fold['models'][name] = results
+        folds.append(fold)
+    if not folds:
+        raise ValueError('Insufficient chronological history for evaluation.')
+    return {'model': 'enhanced', 'total_target_matches': len(y),
+            'data_competitions': sorted({m['competition']['code'] for m in completed}),
+            'evaluation': 'Fixed expanding windows; last fold is final 20%. Earlier results update form; no tuning on these folds.',
+            'form_half_life_days': 120, 'training_half_life_days': 365, 'folds': folds}
+
+
+def run(matches, now, days, model_name='previous'):
+    if model_name not in ('previous', 'enhanced'):
+        raise ValueError('Unknown model specification.')
     valid = {}
     for m in matches:
-        if m.get('competition', {}).get('code') not in COMPETITIONS:
+        if m.get('competition', {}).get('code') not in DATA_COMPETITIONS:
             continue
         if not all(m.get(k, {}).get('id') is not None for k in ('homeTeam', 'awayTeam')):
             continue
-        datetime.fromisoformat(m['utcDate'].replace('Z', '+00:00'))
+        kickoff(m)
         valid[m['id']] = m
     completed = [m for m in valid.values() if m['status'] == 'FINISHED'
-                 and datetime.fromisoformat(m['utcDate'].replace('Z', '+00:00')) < now]
+                 and kickoff(m) < now]
     X, y, dates, state = training_rows(completed)
     if len(y) < 60 or set(y) != set(LABELS):
         raise ValueError('Need at least 60 finished matches and all three outcomes. Fetch more history.')
-    boundary = dates[int(len(dates) * 0.8)]
-    train = np.array([d < boundary for d in dates])
-    test = ~train
-    if len(set(y[train])) != 3:
-        raise ValueError('Chronological training partition lacks all outcomes. Fetch more history.')
-    check = estimator().fit(X[train], y[train])
-    prob = check.predict_proba(X[test])
-    majority = max(LABELS, key=lambda label: sum(y[train] == label))
-    report = {'training_matches': int(train.sum()), 'test_matches': int(test.sum()),
-              'test_start_utc': boundary,
-              'accuracy': float(accuracy_score(y[test], check.predict(X[test]))),
-              'majority_baseline_accuracy': float(np.mean(y[test] == majority)),
-              'log_loss': float(log_loss(y[test], prob, labels=check.classes_)),
-              'evaluation': 'Chronological last 20%; form updates after each completed kickoff. No tuning on holdout.'}
-    model = estimator().fit(X, y)
+    # Report both fixed model specifications on identical target fixtures.
+    old_X, old_y, old_dates, old_state = training_rows(completed, baseline=True)
+    if dates != old_dates or not np.array_equal(y, old_y):
+        raise ValueError('Baseline and enhanced evaluation fixtures differ.')
+    report = evaluate(X, y, dates, completed, old_X)
+    report['model'] = model_name
+    if model_name == 'previous':
+        X, state = old_X, old_state
+    model = fit_model(X, y, dates, weighted=model_name == 'enhanced')
     rows = []
     for m in sorted(valid.values(), key=lambda m: m['utcDate']):
-        kickoff = datetime.fromisoformat(m['utcDate'].replace('Z', '+00:00'))
-        if m['status'] not in ('SCHEDULED', 'TIMED') or not now <= kickoff <= now + timedelta(days=days):
+        when = kickoff(m)
+        if m['competition']['code'] not in COMPETITIONS or m['status'] not in ('SCHEDULED', 'TIMED') or not now <= when <= now + timedelta(days=days):
             continue
         p = dict(zip(model.classes_, model.predict_proba([state.features(m)])[0]))
         h, a = state.keys(m)
-        rows.append({'competition': h[0], 'kickoff_utc': m['utcDate'],
+        rows.append({'competition': m['competition']['code'], 'kickoff_utc': m['utcDate'],
                      'home': m['homeTeam']['name'], 'away': m['awayTeam']['name'],
                      'home_win': p['H'], 'draw': p['D'], 'away_win': p['A'],
                      'prediction': max(p, key=p.get), 'home_history': state.count[h],
@@ -164,8 +219,10 @@ def run(matches, now, days):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--season', type=int, help='Season start year, e.g. 2026 for 2026/27')
-    parser.add_argument('--history', type=int, default=1, help='Seasons including current (default 1; older seasons may require paid access)')
+    parser.add_argument('--history', type=int, default=3, help='Seasons including current (default 3; older seasons may require paid access)')
     parser.add_argument('--days', type=int, default=14)
+    parser.add_argument('--model', choices=('previous', 'enhanced'), default='previous',
+                        help='Previous model remains default; enhanced features did not improve consistently')
     parser.add_argument('--refresh', action='store_true', help='Replace API cache with latest fixtures/results')
     parser.add_argument('--cache', type=Path, default=Path('data/football'))
     parser.add_argument('--output', type=Path, default=Path('outputs/predictions.csv'))
@@ -181,10 +238,10 @@ def main():
         else:
             matches = []
             for year in range(season - args.history + 1, season + 1):
-                for c in COMPETITIONS:
+                for c in DATA_COMPETITIONS:
                     print(f'Loading {c} season {year}...', flush=True)
                     matches.extend(fetch(c, year, os.environ.get('FOOTBALL_DATA_TOKEN'), args.cache, args.refresh)['matches'])
-        output, report = run(matches, now, args.days)
+        output, report = run(matches, now, args.days, args.model)
         args.output.parent.mkdir(parents=True, exist_ok=True)
         output.to_csv(args.output, index=False)
         args.output.with_suffix('.metrics.json').write_text(json.dumps(report, indent=2), encoding='utf-8')
