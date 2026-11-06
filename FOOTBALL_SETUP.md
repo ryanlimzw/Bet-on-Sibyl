@@ -79,3 +79,53 @@ This upgrade does not add xG, injuries, lineups, shots, odds, or rest-day featur
 Provider documentation: https://www.football-data.org/documentation/quickstart and https://docs.football-data.org/general/v4/overtime.html
 
 Validation includes chronological feature isolation, domestic-to-European information flow, time decay, venue tracking, smoothing, regulation-time scores, API cache/auth errors, inadequate history, and probability totals. See `FOOTBALL_VALIDATION.md` for the measured live-data comparison.
+
+## Optional tuned and calibrated model
+
+```bash
+python -m modern_football --model tuned --history 3 --days 30 --refresh
+```
+
+The `tuned` candidate adds rest days, matches played in the previous 14 days, and missing-history indicators. It tests 13 specifications: the original baseline plus enhanced/advanced features with logistic regularization C in {0.1, 0.5, 2} and training half-life in {180, 365} days. Form smoothing remains fixed. The best specification and optional 25/50/75% blend with the original baseline are selected by log loss on an inner tuning period. This is a small logistic-model ensemble, not a tree or neural-network ensemble.
+
+Each outer training prefix is divided at whole UTC day boundaries: first 60% fits candidates; 60–80% selects the specification/blend; first 80% then fits its coefficients; final 20% selects a probability temperature from {0.75, 1, 1.25, 1.5, 2}. Coefficients are deliberately not refit on calibration labels. Production uses the same procedure on all available history, so coefficients exclude the most recent calibration suffix. This trades coefficient freshness for a genuinely separate calibration period. Calibration can help or hurt future accuracy; a calibrated candidate is not a claim of established calibration quality.
+
+Outer test periods are never passed into model selection or calibration. Earlier completed test-period matches still update team form for subsequent days. Existing previously inspected periods remain development evidence. A future untouched period is required before changing the default. The original model remains the default.
+
+Every model now reports multiclass Brier score (sum across classes, range 0–2), top-choice probability reliability bins, expected calibration error, log loss, and a Wilson interval for accuracy. Wilson intervals assume independent outcomes and can understate uncertainty for correlated team schedules. The metrics JSON records selected members, weights, dates, temperature and sample counts. Small bins and small calibration periods are noisy.
+
+### Optional historical xG and ClubElo
+
+```bash
+python -m modern_football --model tuned --input-json data/football/matches.json --xg-csv data/football/xg.csv --clubelo-csv data/football/clubelo.csv
+```
+
+Normalized xG CSV columns:
+
+```csv
+match_id,home_team_id,away_team_id,kickoff_utc,home_xg,away_xg,available_at_utc
+```
+
+Use actual football-data.org match/team IDs and timezone-aware ISO timestamps. Joins require matching fixture ID, both team IDs and kickoff. xG values must be finite and nonnegative. Duplicate IDs are errors; unmatched records are counted as unmatched implicitly through the matched-record count. Historical availability must be after kickoff. Features only use completed prior-day matches whose xG was available before the target's UTC calendar day. Missing xG uses a smoothed prior plus coverage indicators, never the target's own xG. A current download timestamp is safe but will not establish historical availability for backtesting. Retrospectively reconstructed publication times are assumptions and must be recorded as such.
+
+Normalized ClubElo CSV columns:
+
+```csv
+team_id,effective_at_utc,available_at_utc,elo
+```
+
+Map ClubElo names to provider team IDs explicitly before importing. The latest rating whose effective and availability dates both precede the target UTC day is used. Snapshots older than 30 days are treated as missing; coverage and age indicators remain available. Today's ratings must never be copied into historical rows. These external features are available only in advanced candidates; tuning can choose a candidate that does not use them. Neither CSV is required.
+
+A raw Understat downloader is provided:
+
+```bash
+python -m modern_football.external --league EPL --season 2025 --output data/football/understat-EPL-2025.json
+```
+
+It rejects maintenance pages and changed/missing embedded result payloads. Its raw output still needs explicit team/fixture ID mapping and genuine availability timestamps before producing the normalized xG CSV. There is no guessed name matching. Do not pass the raw output to `--input-json`, which expects football-data.org format.
+
+On 6 November 2026 Understat returned a maintenance page (HTTP 200 without results), and the ClubElo CSV API returned HTTP 503 in this environment. Live external-feed ingestion and its accuracy benefit could not be validated. The import paths were tested with synthetic timestamped records; no xG or ClubElo improvement is claimed.
+
+### Local public Premier League CSV validation
+
+`python -m modern_football.public_csv E0_2324.csv E0_2425.csv --output data/football/public-pl.json` converts local football-data.co.uk Premier League results for `--input-json`. It handles UTF-8 BOMs, deduplicates identical fixtures and rejects conflicting results. Kickoff times are interpreted in Europe/London; missing times use noon, which approximates rest intervals. IDs use a separate `fdcsv:` namespace and must not be mixed with football-data.org IDs. This importer includes only finished PL results, no CL history or future fixtures. It does not download data. See `FOOTBALL_VALIDATION.md` for the actual execution results.
