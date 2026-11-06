@@ -8,6 +8,8 @@ from sklearn.preprocessing import StandardScaler
 
 class GoalModel:
     def __init__(self, max_goals=10):
+        if max_goals < 3:
+            raise ValueError('max_goals must be at least 3')
         self.max_goals = max_goals
         self.home = make_pipeline(StandardScaler(), PoissonRegressor(alpha=1.0, max_iter=1000))
         self.away = make_pipeline(StandardScaler(), PoissonRegressor(alpha=1.0, max_iter=1000))
